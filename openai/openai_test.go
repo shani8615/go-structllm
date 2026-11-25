@@ -104,3 +104,49 @@ func TestJSONObjectFormat(t *testing.T) {
 		t.Fatalf("response_format=%v", rf)
 	}
 }
+
+func TestClientErrorsAndFormats(t *testing.T) {
+	ctx := context.Background()
+	if _, err := (&Client{}).Complete(ctx, structllm.Request{}); err == nil || !strings.Contains(err.Error(), "Model is required") {
+		t.Fatalf("missing model: %v", err)
+	}
+	if _, err := (&Client{Model: "m", ResponseFormat: "yaml"}).Complete(ctx, structllm.Request{}); err == nil {
+		t.Fatal("unknown format must fail")
+	}
+	var gotFormat any = "unset"
+	var gotHeader string
+	for name, body := range map[string]string{
+		"no choices": `{"choices":[]}`,
+		"bad json":   `not json`,
+		"plain 500":  ``,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var b map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			gotFormat = b["response_format"]
+			gotHeader = r.Header.Get("api-key")
+			if name == "plain 500" {
+				w.WriteHeader(500)
+			}
+			_, _ = io.WriteString(w, body)
+		}))
+		c := &Client{BaseURL: srv.URL, Model: "m", ResponseFormat: FormatNone, Header: http.Header{"api-key": {"azure-key"}}}
+		_, err := c.Complete(ctx, structllm.Request{Schema: &structllm.Schema{Type: "object"}})
+		srv.Close()
+		if err == nil {
+			t.Errorf("%s: expected error", name)
+		}
+		if name == "plain 500" {
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.Message != "Internal Server Error" {
+				t.Errorf("plain 500: %v", err)
+			}
+		}
+	}
+	if gotFormat != nil || gotHeader != "azure-key" {
+		t.Fatalf("FormatNone must omit response_format (got %v); extra headers must be sent (got %q)", gotFormat, gotHeader)
+	}
+	if _, err := (&Client{BaseURL: "http://127.0.0.1:1", Model: "m"}).Complete(ctx, structllm.Request{}); err == nil {
+		t.Fatal("unreachable server must fail")
+	}
+}
