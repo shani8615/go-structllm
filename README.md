@@ -84,12 +84,25 @@ Already have a reply, for example from a streaming call? Use `structllm.Parse[T]
 
 ## Providers
 
-`openai.Client` speaks the OpenAI chat-completions protocol, so it also works with **Azure OpenAI, Ollama, vLLM, LM Studio, Groq and Together**:
+`openai.Client` speaks the OpenAI chat-completions protocol, so it also works with **Google Gemini, Azure OpenAI, Ollama, vLLM, LM Studio, Groq and Together**:
 
 ```go
-c := &openai.Client{BaseURL: "http://localhost:11434/v1", Model: "llama3.1"} // Ollama
+// Ollama (local, no API key)
+c := &openai.Client{BaseURL: "http://localhost:11434/v1", Model: "llama3.1"}
+
+// Google Gemini (free tier key from Google AI Studio)
+c := &openai.Client{
+    BaseURL: "https://generativelanguage.googleapis.com/v1beta/openai",
+    APIKey:  os.Getenv("GEMINI_API_KEY"),
+    Model:   "gemini-3.5-flash",
+}
+
 c.ResponseFormat = openai.FormatJSONObject // for servers without json_schema support
 ```
+
+Verified against a live model: Gemini (`gemini-3.5-flash`, schema mode) returned a valid result on the first attempt. Model names change often, so check your provider's current list.
+
+**Retries:** rate limits (429), server errors (5xx) and network failures are retried up to twice with exponential backoff and jitter, honouring `Retry-After`. Tune with `MaxRetries`, `RetryBaseDelay` and `MaxRetryWait`, or set `DisableRetries`. Errors keep the provider's real message, including Gemini's array-shaped error bodies.
 
 For anything else, wrap your SDK in a `structllm.ClientFunc`:
 
@@ -99,7 +112,7 @@ client := structllm.ClientFunc(func(ctx context.Context, req structllm.Request) 
 })
 ```
 
-`openai.APIError` exposes `StatusCode` and `Temporary()`, so you can combine it with [go-resilience](https://github.com/shani8615/go-resilience) for retries and circuit breaking. API keys never appear in errors.
+`openai.APIError` exposes `StatusCode`, `Temporary()` and `RetryAfter`, so you can add a circuit breaker with [go-resilience](https://github.com/shani8615/go-resilience). API keys never appear in errors.
 
 ## Testing your code
 
