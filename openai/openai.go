@@ -10,8 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,6 +42,13 @@ type Client struct {
 	ResponseFormat ResponseFormat // default FormatJSONSchema
 	Header         http.Header    // extra headers, e.g. api-key for Azure
 	HTTPClient     *http.Client   // default: 60s timeout
+
+	// Temporary failures (429, 5xx, network errors) are retried with
+	// exponential backoff and jitter, honouring Retry-After.
+	MaxRetries     int           // default 2; ignored when DisableRetries is set
+	DisableRetries bool          // turn retries off entirely
+	RetryBaseDelay time.Duration // first backoff; default 500ms, doubled per retry
+	MaxRetryWait   time.Duration // never wait longer than this per retry; default 30s
 }
 
 // New returns a Client for the given model.
@@ -50,9 +59,10 @@ func New(apiKey, model string) *Client {
 // APIError is a non-2xx response.
 type APIError struct {
 	StatusCode int
-	Type       string
+	Type       string // error type, or the provider's status such as "UNAVAILABLE"
 	Code       string
 	Message    string
+	RetryAfter time.Duration // from the Retry-After header, if any
 }
 
 func (e *APIError) Error() string {
@@ -95,11 +105,6 @@ type chatResponse struct {
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
-	Error *struct {
-		Message string `json:"message"`
-		Type    string `json:"type"`
-		Code    any    `json:"code"`
-	} `json:"error"`
 }
 
 // ErrRefused is returned when the model declines to answer.
@@ -160,27 +165,62 @@ func (c *Client) Complete(ctx context.Context, req structllm.Request) (string, e
 	if hc == nil {
 		hc = &http.Client{Timeout: 60 * time.Second}
 	}
+
+	retries := c.MaxRetries
+	if retries <= 0 {
+		retries = 2
+	}
+	if c.DisableRetries {
+		retries = 0
+	}
+	for attempt := 0; ; attempt++ {
+		content, err := c.do(ctx, hc, base, payload)
+		if err == nil || attempt >= retries || !retryable(ctx, err) {
+			return content, err
+		}
+		wait := c.backoff(attempt, err)
+		if wait < 0 {
+			return "", err // server asked us to wait longer than MaxRetryWait
+		}
+		t := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return "", err
+		case <-t.C:
+		}
+	}
+}
+
+func (c *Client) do(ctx context.Context, hc *http.Client, base string, payload []byte) (string, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/chat/completions", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if c.APIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.APIKey)
+	}
+	for k, vs := range c.Header {
+		for _, v := range vs {
+			httpReq.Header.Add(k, v)
+		}
+	}
 	resp, err := hc.Do(httpReq)
 	if err != nil {
-		return "", fmt.Errorf("openai: request failed: %w", err)
+		return "", &transportError{err}
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return "", fmt.Errorf("openai: read response: %w", err)
+		return "", &transportError{err}
 	}
-
-	var out chatResponse
-	jsonErr := json.Unmarshal(raw, &out)
 	if resp.StatusCode/100 != 2 {
-		e := &APIError{StatusCode: resp.StatusCode, Message: http.StatusText(resp.StatusCode)}
-		if jsonErr == nil && out.Error != nil {
-			e.Message, e.Type, e.Code = out.Error.Message, out.Error.Type, fmt.Sprint(out.Error.Code)
-		}
-		return "", e
+		return "", parseAPIError(resp, raw)
 	}
-	if jsonErr != nil {
-		return "", fmt.Errorf("openai: decode response: %w", jsonErr)
+	var out chatResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", fmt.Errorf("openai: decode response: %w", err)
 	}
 	if len(out.Choices) == 0 {
 		return "", errors.New("openai: response has no choices")
@@ -193,4 +233,107 @@ func (c *Client) Complete(ctx context.Context, req structllm.Request) (string, e
 		return "", ErrTruncated
 	}
 	return ch.Message.Content, nil
+}
+
+// transportError is a network-level failure (connection refused/reset, timeout).
+type transportError struct{ err error }
+
+func (e *transportError) Error() string { return "openai: request failed: " + e.err.Error() }
+func (e *transportError) Unwrap() error { return e.err }
+
+func retryable(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Temporary()
+	}
+	var te *transportError
+	return errors.As(err, &te)
+}
+
+// backoff returns how long to wait before retry number attempt+1, or -1 if
+// the server's Retry-After exceeds MaxRetryWait.
+func (c *Client) backoff(attempt int, err error) time.Duration {
+	maxWait := c.MaxRetryWait
+	if maxWait <= 0 {
+		maxWait = 30 * time.Second
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.RetryAfter > 0 {
+		if apiErr.RetryAfter > maxWait {
+			return -1
+		}
+		return apiErr.RetryAfter
+	}
+	base := c.RetryBaseDelay
+	if base <= 0 {
+		base = 500 * time.Millisecond
+	}
+	d := min(base<<attempt, maxWait)
+	return d/2 + rand.N(d/2+1) // jitter
+}
+
+// errorBody is the error envelope. OpenAI and most compatible servers send
+// {"error":{...}}; Gemini's OpenAI-compatible endpoint sends [{"error":{...}}].
+type errorBody struct {
+	Error *struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+		Status  string `json:"status"` // Gemini: "NOT_FOUND", "UNAVAILABLE", ...
+		Code    any    `json:"code"`
+	} `json:"error"`
+}
+
+func parseAPIError(resp *http.Response, raw []byte) *APIError {
+	e := &APIError{StatusCode: resp.StatusCode, Message: http.StatusText(resp.StatusCode)}
+	e.RetryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
+
+	var body errorBody
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var arr []errorBody
+		if json.Unmarshal(trimmed, &arr) == nil && len(arr) > 0 {
+			body = arr[0]
+		}
+	} else if json.Unmarshal(trimmed, &body) != nil {
+		// Some servers send {"error":"plain text"}.
+		var s struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(trimmed, &s) == nil && s.Error != "" {
+			e.Message = s.Error
+		}
+		return e
+	}
+	if body.Error != nil {
+		if body.Error.Message != "" {
+			e.Message = body.Error.Message
+		}
+		e.Type = body.Error.Type
+		if e.Type == "" {
+			e.Type = body.Error.Status
+		}
+		if body.Error.Code != nil {
+			e.Code = fmt.Sprint(body.Error.Code)
+		}
+	}
+	return e
+}
+
+// parseRetryAfter accepts delay-seconds or an HTTP date.
+func parseRetryAfter(v string) time.Duration {
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
 }

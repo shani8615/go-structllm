@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/shani8615/go-structllm"
 )
@@ -60,7 +63,7 @@ func TestAPIErrorDoesNotLeakKey(t *testing.T) {
 		_, _ = io.WriteString(w, `{"error":{"message":"Rate limit reached","type":"requests","code":"rate_limit_exceeded"}}`)
 	}))
 	defer srv.Close()
-	c := &Client{BaseURL: srv.URL, APIKey: "super-secret-key", Model: "m"}
+	c := &Client{BaseURL: srv.URL, APIKey: "super-secret-key", Model: "m", DisableRetries: true}
 	_, err := c.Complete(context.Background(), structllm.Request{Messages: []structllm.Message{{Role: "user", Content: "hi"}}})
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.StatusCode != 429 || !apiErr.Temporary() || apiErr.Code != "rate_limit_exceeded" {
@@ -130,7 +133,7 @@ func TestClientErrorsAndFormats(t *testing.T) {
 			}
 			_, _ = io.WriteString(w, body)
 		}))
-		c := &Client{BaseURL: srv.URL, Model: "m", ResponseFormat: FormatNone, Header: http.Header{"api-key": {"azure-key"}}}
+		c := &Client{BaseURL: srv.URL, Model: "m", ResponseFormat: FormatNone, Header: http.Header{"api-key": {"azure-key"}}, RetryBaseDelay: time.Millisecond}
 		_, err := c.Complete(ctx, structllm.Request{Schema: &structllm.Schema{Type: "object"}})
 		srv.Close()
 		if err == nil {
@@ -146,7 +149,163 @@ func TestClientErrorsAndFormats(t *testing.T) {
 	if gotFormat != nil || gotHeader != "azure-key" {
 		t.Fatalf("FormatNone must omit response_format (got %v); extra headers must be sent (got %q)", gotFormat, gotHeader)
 	}
-	if _, err := (&Client{BaseURL: "http://127.0.0.1:1", Model: "m"}).Complete(ctx, structllm.Request{}); err == nil {
+	if _, err := (&Client{BaseURL: "http://127.0.0.1:1", Model: "m", RetryBaseDelay: time.Millisecond}).Complete(ctx, structllm.Request{}); err == nil {
 		t.Fatal("unreachable server must fail")
+	}
+}
+
+// Regression fixtures: real error messages from Gemini's OpenAI-compatible
+// endpoint, which wraps errors in a JSON array. They were previously
+// reported as the bare status text ("Not Found", "Service Unavailable").
+const (
+	geminiModelRetired = `[{"error":{"code":404,"message":"This model models/gemini-2.5-flash is no longer available to new users. Please update your code to use models/gemini-3.8-flash ...","status":"NOT_FOUND"}}]`
+	geminiHighDemand   = `[{"error":{"code":503,"message":"This model is currently experiencing high demand ... Please try again later.","status":"UNAVAILABLE"}}]`
+)
+
+func serveStatus(t *testing.T, status int, body string, hits *atomic.Int32) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestGeminiArrayErrorBodies(t *testing.T) {
+	for _, tc := range []struct {
+		status    int
+		body      string
+		wantMsg   string
+		wantType  string
+		temporary bool
+	}{
+		{404, geminiModelRetired, "is no longer available to new users", "NOT_FOUND", false},
+		{503, geminiHighDemand, "currently experiencing high demand", "UNAVAILABLE", true},
+	} {
+		var hits atomic.Int32
+		srv := serveStatus(t, tc.status, tc.body, &hits)
+		c := &Client{BaseURL: srv.URL, Model: "m", DisableRetries: true}
+		_, err := c.Complete(context.Background(), structllm.Request{})
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) {
+			t.Fatalf("%d: err=%v", tc.status, err)
+		}
+		if !strings.Contains(apiErr.Message, tc.wantMsg) || apiErr.Type != tc.wantType ||
+			apiErr.Code != fmt.Sprint(tc.status) || apiErr.Temporary() != tc.temporary {
+			t.Errorf("%d: got %+v", tc.status, apiErr)
+		}
+		if !strings.Contains(err.Error(), tc.wantMsg) {
+			t.Errorf("%d: provider message must appear in the error, got %q", tc.status, err)
+		}
+	}
+}
+
+func TestRetriesTemporaryErrorsThenSucceeds(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if hits.Add(1) <= 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, geminiHighDemand)
+			return
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{}"},"finish_reason":"stop"}]}`)
+	}))
+	defer srv.Close()
+	c := &Client{BaseURL: srv.URL, Model: "m", RetryBaseDelay: time.Millisecond}
+	got, err := c.Complete(context.Background(), structllm.Request{})
+	if err != nil || got != "{}" || hits.Load() != 3 {
+		t.Fatalf("got=%q err=%v hits=%d", got, err, hits.Load())
+	}
+}
+
+func TestDoesNotRetryPermanentErrors(t *testing.T) {
+	var hits atomic.Int32
+	srv := serveStatus(t, 404, geminiModelRetired, &hits)
+	c := &Client{BaseURL: srv.URL, Model: "m", RetryBaseDelay: time.Millisecond}
+	if _, err := c.Complete(context.Background(), structllm.Request{}); err == nil || hits.Load() != 1 {
+		t.Fatalf("404 must not be retried: err=%v hits=%d", err, hits.Load())
+	}
+}
+
+func TestRetryLimitAndDisable(t *testing.T) {
+	var hits atomic.Int32
+	srv := serveStatus(t, 503, geminiHighDemand, &hits)
+	c := &Client{BaseURL: srv.URL, Model: "m", MaxRetries: 3, RetryBaseDelay: time.Millisecond}
+	if _, err := c.Complete(context.Background(), structllm.Request{}); err == nil || hits.Load() != 4 {
+		t.Fatalf("want 1 call + 3 retries, got %d (err=%v)", hits.Load(), err)
+	}
+	hits.Store(0)
+	c.DisableRetries = true
+	_, _ = c.Complete(context.Background(), structllm.Request{})
+	if hits.Load() != 1 {
+		t.Fatalf("DisableRetries: %d calls", hits.Load())
+	}
+}
+
+func TestHonoursRetryAfter(t *testing.T) {
+	var hits atomic.Int32
+	var first time.Time
+	var gap time.Duration
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		switch hits.Add(1) {
+		case 1:
+			first = time.Now()
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+		default:
+			gap = time.Since(first)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`)
+		}
+	}))
+	defer srv.Close()
+	c := &Client{BaseURL: srv.URL, Model: "m", RetryBaseDelay: time.Millisecond}
+	if _, err := c.Complete(context.Background(), structllm.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if gap < 900*time.Millisecond {
+		t.Fatalf("Retry-After: 1 ignored, retried after %v", gap)
+	}
+
+	// A Retry-After longer than MaxRetryWait is not waited out.
+	var hits2 atomic.Int32
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits2.Add(1)
+		w.Header().Set("Retry-After", "3600")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv2.Close()
+	start := time.Now()
+	_, err := (&Client{BaseURL: srv2.URL, Model: "m", MaxRetryWait: time.Second}).Complete(context.Background(), structllm.Request{})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.RetryAfter != time.Hour || hits2.Load() != 1 || time.Since(start) > time.Second {
+		t.Fatalf("err=%v hits=%d", err, hits2.Load())
+	}
+}
+
+func TestRetryStopsWhenContextEnds(t *testing.T) {
+	var hits atomic.Int32
+	srv := serveStatus(t, 503, geminiHighDemand, &hits)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	c := &Client{BaseURL: srv.URL, Model: "m", RetryBaseDelay: time.Second}
+	start := time.Now()
+	if _, err := c.Complete(ctx, structllm.Request{}); err == nil || time.Since(start) > 500*time.Millisecond {
+		t.Fatalf("must give up when ctx ends: err=%v after %v", err, time.Since(start))
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	if parseRetryAfter("7") != 7*time.Second || parseRetryAfter("") != 0 || parseRetryAfter("soon") != 0 {
+		t.Fatal("seconds form")
+	}
+	if d := parseRetryAfter(time.Now().Add(5 * time.Second).UTC().Format(http.TimeFormat)); d < 3*time.Second || d > 6*time.Second {
+		t.Fatalf("http-date form: %v", d)
+	}
+	rec := httptest.NewRecorder()
+	rec.WriteHeader(502)
+	if got := parseAPIError(rec.Result(), []byte(`{"error":"bad gateway upstream"}`)); got.Message != "bad gateway upstream" {
+		t.Fatalf("string error body: %+v", got)
 	}
 }
