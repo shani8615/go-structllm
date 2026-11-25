@@ -12,6 +12,8 @@
 
 <sub>Runs without an API key: `go run ./examples/demo`</sub>
 
+**Read the story behind it:** [Getting reliable structured output from LLMs in Go](https://dev.to/zeeshan_sarwar_12e2bcbdab/getting-reliable-structured-output-from-llms-in-go-509c) on dev.to: the design, and what broke when testing against a real model.
+
 ```bash
 go get github.com/shani8615/go-structllm
 ```
