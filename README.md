@@ -2,8 +2,16 @@
 
 [![ci](https://github.com/shani8615/go-structllm/actions/workflows/ci.yml/badge.svg)](https://github.com/shani8615/go-structllm/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/shani8615/go-structllm.svg)](https://pkg.go.dev/github.com/shani8615/go-structllm)
+[![Go Report Card](https://goreportcard.com/badge/github.com/shani8615/go-structllm)](https://goreportcard.com/report/github.com/shani8615/go-structllm)
+[![Release](https://img.shields.io/github/v/release/shani8615/go-structllm?sort=semver)](https://github.com/shani8615/go-structllm/releases)
+[![Go version](https://img.shields.io/github/go-mod/go-version/shani8615/go-structllm)](go.mod)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Typed, validated LLM output for Go.** Describe what you want as a Go struct and get back a `T` or a precise error, never a half-parsed value. It works like Instructor/Pydantic, but for Go, and it has no dependencies outside the standard library.
+**Typed, validated LLM output for Go.** Describe what you want as a Go struct and get back a `T` or a precise error, never a half-parsed value. It brings the Instructor/Pydantic approach from Python to Go, with no dependencies outside the standard library.
+
+![go-structllm: an invalid reply is sent back with exact errors and fixed on the next attempt](docs/demo.gif)
+
+<sub>Runs without an API key: `go run ./examples/demo`</sub>
 
 ```bash
 go get github.com/shani8615/go-structllm
@@ -97,6 +105,21 @@ client := structllm.ClientFunc(func(ctx context.Context, req structllm.Request) 
 ## Testing your code
 
 `Client` is a single-method interface, so tests can use a scripted fake. See `example_test.go`.
+
+## Why go-structllm?
+
+| | go-structllm | [instructor-go](https://github.com/jxnl/instructor-go) | `json.Unmarshal` + retry loop |
+|---|---|---|---|
+| Dependencies | standard library only | uses provider SDK clients | none |
+| Providers | anything behind a 1-method `Client`; OpenAI-compatible client included | OpenAI, Anthropic, Gemini and Cohere built in | yours |
+| Schema from struct tags | ✓ enums, lengths, item counts, bounds, patterns, dates | ✓ via `jsonschema` tags | ✗ |
+| Errors sent back with JSON paths (`$.tags[2]: …`) | ✓ | ✓ retries with validation messages | write it yourself |
+| Business rules via `Validate() error` | ✓ fed back to the model | — | write it yourself |
+| Streaming partial objects | ✗ (use `Parse[T]` on the final text) | ✓ | — |
+
+<sub>— = not documented in that project's README/docs at the time of writing.</sub>
+
+**Pick go-structllm** if you want a small, dependency-free core that works with any model through one interface, including local models via Ollama or vLLM. **Pick instructor-go** if you need streaming partial objects or tool-call mode today.
 
 ## License
 
