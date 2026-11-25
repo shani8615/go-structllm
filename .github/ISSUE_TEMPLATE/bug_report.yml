@@ -1,0 +1,41 @@
+name: Bug report
+description: Something doesn't work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for reporting! Please **don't** include secrets, tokens or personal data. For security issues use private vulnerability reporting instead.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `go list -m github.com/shani8615/go-structllm` (or the commit you're on)
+      placeholder: v0.1.1
+    validations:
+      required: true
+  - type: input
+    id: go
+    attributes:
+      label: Go version and OS
+      placeholder: go1.24.3 linux/amd64
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Include error messages or log output.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: The smallest program or test that shows the problem.
+      render: go
